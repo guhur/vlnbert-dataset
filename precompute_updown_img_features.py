@@ -6,18 +6,22 @@ Faster R-CNN pretrained on Visual Genome)
 """
 from dataclasses import dataclass, field
 from typing import List, Dict, Union
+from pathlib import Path
 import cv2
 import json
+import argtyped
 import math
 import base64
 import csv
 import os
 import sys
 import random
-from timer import Timer
 from multiprocessing import Pool
+from tqdm.auto import trange, tqdm
 from sklearn.metrics import pairwise_distances
 import numpy as np
+import requests
+from tqdm import tqdm
 from scipy.spatial.distance import cosine
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -29,16 +33,17 @@ from torchvision.ops import nms
 import MatterSim  # MatterSim needs to be on the Python path
 
 bottomup_root = "./bottom-up-attention.pytorch/"
-sys.path.insert(0, bottomup_root)
+sys.path.append(bottomup_root)
 
+from models.bua import _C
+from models.bua.box_regression import BUABoxes
+from models import add_config
+from utils.progress_bar import ProgressBar
+from extract_features import setup
 from utils.utils import mkdir, save_features
 from utils.extract_utils import (
     save_roi_features,
 )
-from utils.progress_bar import ProgressBar
-from models import add_config
-from models.bua.box_regression import BUABoxes
-from extract_features import setup
 
 mpl.use("Agg")
 random.seed(1)
@@ -76,8 +81,10 @@ ELEVATION_INC = 30  # How much elevation increases each sweep
 # Filesystem etc
 FEATURE_SIZE = 2048
 # UPDOWN_DATA = caffe_root + "/data/genome/1600-400-20"
-OUTFILE = "img_features/ResNet-101-faster-rcnn-genome.tsv"
+OUTFILE = "ResNet-101-faster-rcnn-genome.tsv"
 GRAPHS = "connectivity/"
+MODEL_PATH = "bua-caffe-frcn-r101_with_attributes.pth"
+MODEL_URL = f"https://vln-r2r.s3.amazonaws.com/{MODEL_PATH}"
 
 # Simulator image parameters
 WIDTH = 600  # Max size handled by Faster R-CNN model
@@ -196,7 +203,7 @@ def visual_overlay(im, dets, ix, classes, attributes):
 
 @torch.no_grad()
 def get_detections_from_im(
-    record, net: nn.Module, im: np.ndarray, conf_thresh=CONF_THRESH
+    record, model: nn.Module, im: np.ndarray, cfg, conf_thresh=CONF_THRESH
 ):
     #     im = cv2.imread(os.path.join(args.image_dir, im_file))
     dataset_dict = get_image_blob(im, cfg.MODEL.PIXEL_MEAN)
@@ -349,7 +356,19 @@ def filter(record, max_boxes):
 #     return classes, attributes
 
 
-def build_tsv(net: nn.Module):
+def build_tsv(gpu_id: int = 0):
+    args = Argument()
+    cfg = setup(args)
+
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+
+    model = DefaultTrainer.build_model(cfg)
+    DetectionCheckpointer(model).resume_or_load(
+        cfg.MODEL.WEIGHTS,
+        resume=False,
+    )
+    model.eval()
+
     # Set up the simulator
     print("Starting sim")
     sim = MatterSim.Simulator()
@@ -357,21 +376,14 @@ def build_tsv(net: nn.Module):
     sim.setCameraVFOV(math.radians(VFOV))
     sim.setDiscretizedViewingAngles(False)
     sim.setBatchSize(1)
-    sim.setPreloadingEnabled(True)
+    sim.setPreloadingEnabled(False)
     sim.initialize()
 
     print("Sim has start")
     # import pdb
 
     # pdb.set_trace()
-    # caffe.set_mode_gpu()
-    # caffe.set_device(gpu_id)
-    # net = caffe.Net(PROTO, caffe.TEST, weights=MODEL)
-    # classes, attributes = load_classes()
 
-    count = 0
-    t_render = Timer()
-    t_net = Timer()
     print("STARTING")
     with open(OUTFILE, "wt") as tsvfile:
         writer = csv.DictWriter(tsvfile, delimiter="\t", fieldnames=TSV_FIELDNAMES)
@@ -380,8 +392,7 @@ def build_tsv(net: nn.Module):
         print("loading viewpoints")
         viewpoint_ids = load_viewpointids()
 
-        for scanId, viewpointId in viewpoint_ids:
-            t_render.tic()
+        for scanId, viewpointId in tqdm(viewpoint_ids):
             # Loop all discretized views from this location
             ims = []
             sim.newEpisode(
@@ -415,45 +426,15 @@ def build_tsv(net: nn.Module):
                     elev = math.radians(ELEVATION_INC)
                 sim.makeAction([0], [heading_chg], [elev])
 
-            t_render.toc()
-            t_net.tic()
             # Run detection
             for ix in range(VIEWPOINT_SIZE):
-                get_detections_from_im(record, net, ims[ix])
-            if DRY_RUN:
-                print("Detected %d objects in pano" % record["features"].shape[0])
+                get_detections_from_im(record, model, ims[ix], cfg)
             filter(record, MAX_TOTAL_BOXES)
-            # if DRY_RUN:
-            # print("Reduced to %d objects in pano" % record["features"].shape[0])
-            # for ix in range(VIEWPOINT_SIZE):
-            #     fig = visual_overlay(ims[ix], record, ix, classes, attributes)
-            #     fig.savefig(
-            #         "img_features/examples/%s-%s-%d.png"
-            #         % (record["scanId"], record["viewpointId"], ix)
-            #     )
-            #     plt.close()
 
             for k, v in record.items():
                 if isinstance(v, np.ndarray):
                     record[k] = str(base64.b64encode(v), "utf-8")
             writer.writerow(record)
-            count += 1
-            t_net.toc()
-            if count % 10 == 0:
-                print(
-                    "Processed %d / %d viewpoints, %.1fs avg render time, %.1fs avg net time, projected %.1f hours"
-                    % (
-                        count,
-                        len(viewpoint_ids),
-                        t_render.average_time,
-                        t_net.average_time,
-                        (t_render.average_time + t_net.average_time)
-                        * len(viewpoint_ids)
-                        / 3600,
-                    )
-                )
-                if DRY_RUN:
-                    return
 
 
 def read_tsv(infile):
@@ -506,37 +487,27 @@ def read_tsv(infile):
 
 
 @dataclass
-class Argument:
-    min_max_boxes: str
-    extract_mode: str
-    mode: str
-    gpu_id: str
-    num_cpus: int
-    config_file: str
+class Argument(argtyped.Arguments):
+    min_max_boxes: str = "10,100"
+    extract_mode: str = "roi_feats"
+    mode: str = "caffe"
+    num_cpus: int = 4
+    num_gpus: int = 1
+    config_file: str = bottomup_root + "configs/bua-caffe/extract-bua-caffe-r101.yaml"
     opts: List = field(default_factory=list)
 
 
 if __name__ == "__main__":
-    args = Argument(
-        "10,100",
-        "roi_feats",
-        "caffe",
-        "1",
-        4,
-        bottomup_root + "configs/bua-caffe/extract-bua-caffe-r101.yaml",
-    )
-    cfg = setup(args)
+    args = Argument()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    if not Path(MODEL_PATH).is_file():
+        print("Downloading model")
+        response = requests.get(MODEL_URL, stream=True)
 
-    model = DefaultTrainer.build_model(cfg)
-    DetectionCheckpointer(model).resume_or_load(
-        cfg.MODEL.WEIGHTS,
-        resume=False,
-    )
-    model.eval()
+        with open(MODEL_PATH, "wb") as handle:
+            for data in tqdm(response.iter_content()):
+                handle.write(data)
 
-    build_tsv(model)
-    # gpu_ids = range(NUM_GPUS)
-    # p = Pool(NUM_GPUS)
-    # p.map(build_tsv, gpu_ids)
+    gpu_ids = range(args.num_gpus)
+    p = Pool(args.num_gpus)
+    p.map(build_tsv, gpu_ids)
