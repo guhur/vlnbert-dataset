@@ -32,18 +32,17 @@ from detectron2.engine import DefaultTrainer
 from torchvision.ops import nms
 import MatterSim  # MatterSim needs to be on the Python path
 
-bottomup_root = "./bottom-up-attention.pytorch/"
-sys.path.append(bottomup_root)
+bottomup_root = "bottom-up-attention.pytorch/"
 
-from models.bua import _C
-from models.bua.box_regression import BUABoxes
-from models import add_config
-from utils.progress_bar import ProgressBar
-from extract_features import setup
+sys.path.append(bottomup_root)
+# sys.path.insert(0, bottomup_root)
+
 from utils.utils import mkdir, save_features
-from utils.extract_utils import (
-    save_roi_features,
-)
+from utils.extract_utils import get_image_blob, save_bbox, save_roi_features_by_bbox, save_roi_features
+from utils.progress_bar import ProgressBar
+from models import add_config
+from models.bua.box_regression import BUABoxes
+from extract_features import setup
 
 mpl.use("Agg")
 random.seed(1)
@@ -103,37 +102,6 @@ CONF_THRESH = 0.4  # increased from 0.2 in bottom-up paper
 
 TEST_SCALES = (600,)
 TEST_MAX_SIZE = 1000
-
-
-def get_image_blob(im: np.ndarray, pixel_means) -> Dict:
-    """Converts an image into a network input."""
-    pixel_means = np.array([[pixel_means]])
-    im_orig = im.astype(np.float32, copy=True)
-    im_orig -= pixel_means
-
-    im_shape = im_orig.shape
-    im_size_min = np.min(im_shape[0:2])
-    im_size_max = np.max(im_shape[0:2])
-
-    for target_size in TEST_SCALES:
-        im_scale = float(target_size) / float(im_size_min)
-        # Prevent the biggest axis from being more than MAX_SIZE
-        if np.round(im_scale * im_size_max) > TEST_MAX_SIZE:
-            im_scale = float(TEST_MAX_SIZE) / float(im_size_max)
-        im = cv2.resize(
-            im_orig,
-            None,
-            None,
-            fx=im_scale,
-            fy=im_scale,
-            interpolation=cv2.INTER_LINEAR,
-        )
-
-    dataset_dict: Dict[str, Union[float, torch.Tensor]] = {}
-    dataset_dict["image"] = torch.from_numpy(im).permute(2, 0, 1)
-    dataset_dict["im_scale"] = im_scale
-
-    return dataset_dict
 
 
 def load_viewpointids() -> List:
