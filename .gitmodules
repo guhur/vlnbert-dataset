@@ -1,6 +1,6 @@
 [submodule "bottom-up-attention.pytorch"]
 	path = bottom-up-attention.pytorch
-	url = https://github.com/MILVLG/bottom-up-attention.pytorch
+	url = https://github.com/guhur/bottom-up-attention.pytorch
 [submodule "Matterport3DSimulator"]
 	path = Matterport3DSimulator
 	url = https://github.com/peteanderson80/Matterport3DSimulator/
